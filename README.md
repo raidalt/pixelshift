@@ -55,7 +55,7 @@ The app exports uncompressed 16-bit RGB BigTIFFs with an embedded sRGB or linear
 
 ## Focus stacking
 
-Choose **Focus stack** in **Capture workflow**, select the SD card or source folder, and review the newest candidate sequence. Detection follows capture times, sequence counters, matching exposure settings, and image dimensions; it does **not** certify that focus changed or that the sweep is complete. Pixel-shift captures are excluded. Matching RAW/rendered pairs are deduplicated with RAW preferred. Use the frame checkboxes to exclude unwanted photos, then click **Build focus stack**.
+Choose **Focus stack** under **Mode**, select the SD card or source folder, and review the newest candidate sequence. Detection follows capture times, sequence counters, matching exposure settings, and image dimensions; it does **not** certify that focus changed or that the sweep is complete. Pixel-shift captures are excluded. Matching RAW/rendered pairs are deduplicated with RAW preferred. Use the frame checkboxes to exclude unwanted photos, then click **Build focus stack**.
 
 Focus mode supports 2–100 matching ARW, SDR sRGB HIF/HEIF, JPEG, or TIFF frames. For Sony HIF decoding install [libheif](https://github.com/strukturag/libheif):
 
@@ -72,6 +72,8 @@ The **Focus source map** identifies the locally preferred frame; **Focus selecti
 A stack cannot restore regions blurred in every frame. Identical recorded focus positions trigger a warning, but some cameras do not record a useful focus distance. Motion, parallax, reflections, defocus halos, and insufficient overlap can still cause artifacts. Inspect boundaries at 100% and use the comparison and maps before relying on the output.
 
 ## Compare the result
+
+The workspace keeps source selection and build/export actions visible. Open **Advanced settings** for presets and tuning, or **Image details** for reference-frame selection, clipping, histograms, and frame diagnostics. Choosing a diagnostic view opens its details automatically.
 
 After a build, use **Swipe comparison**, **Blink**, **Difference**, or **Registration overlay**. Drag to pan, scroll to zoom, and choose **100%** for one output pixel per device pixel. Hold Space to blink. Select any available original frame as the reference.
 
