@@ -50,3 +50,5 @@ outputs/
 *.[hH][eE][iI][fF]
 *.[tT][iI][fF].json
 *.[tT][iI][fF][fF].json
+
+.pixelshift-data/

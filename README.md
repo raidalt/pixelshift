@@ -9,7 +9,12 @@ Pixelshift reconstructs color from the original sensor samples. It is an indepen
 - Find complete pixel-shift sequences anywhere within a selected SD card or drive.
 - Verify capture groups and frame order using Sony metadata rather than filenames.
 - Align frames using detailed regions of the image and reconstruct directly from RAW color samples.
-- Inspect the result with a draggable comparison slider, automatic detail selection, and zoom controls.
+- Inspect the full image with a comparison slider, pan, true 100%/200% pixel views, blink, amplified differences, and registration overlays.
+- Tune alignment thresholds, strict or warning mode, include/exclude regions, reconstruction kernels, and sample support.
+- Inspect RAW support, alignment confidence, interpolation maps, and per-frame measurements.
+- Adjust exposure, camera or custom white balance, optional sharpening and denoising, with a live histogram and clipping overlays.
+- Save local presets and export sRGB or linear RGB TIFFs with embedded ICC profiles, custom names, and border cropping.
+- Track processing stages, elapsed time, estimated reconstruction time remaining, and cancel a job.
 - Save to `~/Pictures/Pixel Shift` with unique filenames, preserving the original ARWs.
 
 | Capture mode | Output dimensions | Pixel count |
@@ -24,7 +29,7 @@ Pixel count describes the output dimensions; resolved detail also depends on foc
 - macOS and Python 3.11 or newer
 - [ExifTool](https://exiftool.org/) available on your `PATH`
 - A complete 4- or 16-shot sequence of full-size Sony α7R V ARW files
-- Several GB of available RAM and approximately 10 GB of free disk space for a 16-frame job
+- Several GB of available RAM and approximately 12 GB of free disk space for a 16-frame job
 
 If you use Homebrew, you can install the prerequisites with:
 
@@ -46,43 +51,47 @@ To launch from Terminal instead:
 zsh Start.command
 ```
 
-The app exports an uncompressed, 16-bit RGB BigTIFF using sRGB encoding, with an embedded sRGB profile when available. A JSON report beside the TIFF records alignment measurements, warnings, and interpolation statistics.
+The app exports uncompressed 16-bit RGB BigTIFFs with an embedded sRGB or linear-sRGB ICC profile. A JSON report records settings, alignment measurements, warnings, and interpolation statistics. Editable camera data and the first reference image are kept in a hidden `.pixelshift-data` folder beside the output. Keep this folder to revisit adjustments and support maps. Additional original frames require the source drive.
 
 ## Compare the result
 
-After a merge, drag across **Original / Composite** or use the slider. Choose **Best detail**, the center, or another region, and adjust the zoom from 1× to 8×.
+After a build, use **Swipe comparison**, **Blink**, **Difference**, or **Registration overlay**. Drag to pan, scroll to zoom, and choose **100%** for one output pixel per device pixel. Hold Space to blink. Select any available original frame as the reference.
 
-Both sides use the same scene coordinates, white balance, exposure, and color transform. No sharpening is added. For 16-frame composites, the original is enlarged 2× with nearest-neighbor sampling to match the composite's field of view. Previews are 8-bit; the saved TIFF remains 16-bit.
+Both sides use the same scene coordinates, white balance, exposure, and finishing. Sharpening and denoising default to zero. For 16-frame composites, the original is enlarged 2× with nearest-neighbor sampling. Previews are 8-bit; the saved TIFF is 16-bit. Histograms and clipping percentages describe the visible region.
+
+RAW support shows normalized sample coverage; alignment confidence shows registration correlation, not a probability of correctness. The interpolation map identifies pixels requiring wider sample support. Legacy TIFFs without an editable cache support exposure and finishing using their existing rendered color; RAW white balance, support maps, and offline original comparisons require a new build.
+
+Alignment, region, and reconstruction changes require **Build composite**. Color, finishing, encoding, naming, and border changes can use **Export current adjustments**. Existing files are never overwritten.
 
 ## How reconstruction works
 
 Pixelshift reads the original CFA samples through RawPy/LibRaw, applies the recorded crop and black levels, and estimates global translations from texture-selected regions. It combines the measured color samples on the output grid using normalized convolution. On ideal integer- or half-pixel sampling positions, this reduces to direct color interleaving with two-green averaging.
 
-Sampling gaps use a wider interpolation kernel; the app and report disclose their frequency. Camera white balance, a camera-to-sRGB matrix, and the sRGB transfer curve are applied after reconstruction.
+Sampling gaps use a wider interpolation kernel; the app and report disclose their frequency. Camera white balance, a camera-to-sRGB matrix, and the selected transfer curve are applied after reconstruction. Custom temperature/tint uses an approximate Planckian white point and the camera calibration matrix.
 
 ## Limitations
 
 - Supports full-size α7R V RAWs and complete, matching capture groups.
 - Corrects global translation, not rotation, local subject motion, or optical distortion. Moving subjects can produce artifacts.
-- Conflicting alignment estimates produce a warning and continue using the median translation. Unusable alignment still stops processing. A warning does not prove the camera moved.
-- Does not export ARQ or apply lens corrections, highlight reconstruction, denoising, or sharpening.
+- In warning mode, conflicting alignment estimates continue using the median translation; strict mode stops at the configured thresholds. Unusable alignment still stops processing. A warning does not prove the camera moved.
+- Does not export ARQ or apply lens corrections, local motion correction, or highlight reconstruction.
 - Has been exercised with real 4- and 16-frame captures and synthetic tests. Equivalence to Sony's output and quantitative resolution gains remain unverified.
 
 ## Privacy
 
 Photo processing happens on your Mac. The server listens only on `127.0.0.1`, and processing requests require a per-launch token. There are no photo uploads, accounts, or telemetry.
 
-This repository contains no sample photos, capture reports, credentials, or personal settings. Generated photos, reports, caches, and local environments are excluded by `.gitignore`. Reports generated during use can contain local filenames and capture metadata; review them before sharing.
+This repository contains no sample photos, capture reports, credentials, or personal settings. Generated photos, reports, caches, and local environments are excluded by `.gitignore`. Reports generated during use contain local source paths and capture metadata, and editable caches contain image data. Keep these private unless you intend to share them.
 
 ## Development
 
 After the launcher has installed the dependencies:
 
 ```sh
-.venv/bin/python test_engine.py
+.venv/bin/python -m unittest discover -p 'test*.py'
 ```
 
-Tests cover exact synthetic 4- and 16-frame reconstruction, color calibration, sequence validation, nested-folder discovery, alignment, output naming, and local request authentication. No camera files are required.
+Tests cover exact synthetic 4- and 16-frame reconstruction, color calibration, sequence validation, nested-folder discovery, alignment, output naming, local request authentication, tuning validation, masks, strict thresholds, presets, ICC profiles, offline inspection, and preview/export parity. No camera files are required.
 
 ## References
 
