@@ -37,17 +37,18 @@ def describe():
         crop=job['settings']['border']
         return {'width':w,'height':h,'border':crop,'scale':r.get('scale',2 if w>10000 else 1),
                 'frames':r.get('frames',[]),'regions':r.get('registration_regions',[]),'settings':job['settings'],
-                'maps':bool(job['cache'] and (job['cache']/'maps.npy').is_file()),'raw_controls':not job['legacy'],
+                'warnings':r.get('warnings',[]),'kind':r.get('kind','pixelshift'),'focus_maps':bool(job['cache'] and (job['cache']/'focus-maps.npy').is_file()),
+                'maps':bool(job['cache'] and (job['cache']/'maps.npy').is_file()),'raw_controls':not job['legacy'] and job['meta'].get('space')!='linear_srgb',
                 'output':str(job['output']),'version':job['version'],'sources':len(r.get('sources',[])),
-                'source_available':[Path(p).is_file() or (i==0 and bool(job['cache']) and (job['cache']/'reference.npy').is_file()) for i,p in enumerate(r.get('sources',[]))],
+                'source_available':[Path(p).is_file() or (r.get('kind')=='focus' and bool(job['cache']) and (job['cache']/f'frame-{i}.npy').is_file()) or (i==0 and bool(job['cache']) and (job['cache']/'reference.npy').is_file()) for i,p in enumerate(r.get('sources',[]))],
                 'sensor_crop':job['meta'].get('crop',[0,0]),
-                'message':'Legacy TIFF: exposure and finishing use its existing rendered color. RAW white balance and support maps require a new build.' if job['legacy'] else 'Full-resolution RAW reconstruction cache available.'}
+                'message':('Focus stack · '+str(len(r.get('frames',[])))+' frames · offline references available. Focus selection maps describe sharpness, not physical depth.') if r.get('kind')=='focus' else 'Legacy TIFF: exposure and finishing use its existing rendered color. RAW white balance and support maps require a new build.' if job['legacy'] else 'Full-resolution RAW reconstruction cache available.'}
 
 def view(settings):
     import secrets
     with LOCK:
         job=require();settings=validate(settings)
-        if job['legacy'] and settings['white_balance']!='camera':raise ValueError('Custom temperature requires a fresh RAW reconstruction.')
+        if (job['legacy'] or job['meta'].get('space')=='linear_srgb') and settings['white_balance']!='camera':raise ValueError('Custom temperature requires a fresh RAW reconstruction.')
         key=secrets.token_hex(8);job['views'][key]=settings
         while len(job['views'])>12:job['views'].pop(next(iter(job['views'])))
         return {'view':key,**describe()}
@@ -86,6 +87,19 @@ def original(bounds,settings,index=0,aligned=True):
     sx=shift.get('x',0) if aligned else 0;sy=shift.get('y',0) if aligned else 0
     left=max(0,int(x/scale+sx)-32)//2*2;top=max(0,int(y/scale+sy)-32)//2*2
     nw=int(w/scale)+72;nh=int(h/scale)+72
+    if report.get('kind')=='focus':
+        source=cache/f'frame-{index}.npy' if cache else None
+        if not source or not source.is_file():raise ValueError('Offline focus reference cache is unavailable. Rebuild the stack.')
+        array=np.load(source,mmap_mode='r');matrix=np.array(shift.get('matrix',[[1,0,0],[0,1,0]]),np.float32) if aligned else np.eye(2,3,dtype=np.float32)
+        xx=np.linspace(x,x+w-1,ow,dtype=np.float32)[None,:];yy=np.linspace(y,y+h-1,oh,dtype=np.float32)[:,None]
+        mx=matrix[0,0]*xx+matrix[0,1]*yy+matrix[0,2];my=matrix[1,0]*xx+matrix[1,1]*yy+matrix[1,2]
+        low=max(0,int(my.min())-3);high=min(array.shape[0],int(my.max())+4)
+        if high<=low:raise ValueError('Reference crop is outside the image.')
+        # Decimate fit views before resampling to keep full-image inspection bounded.
+        step=max(1,int(min(w/max(ow,1),h/max(oh,1))))
+        patch=np.asarray(array[low:high:step,::step]).copy()
+        rgb=cv2.remap(patch,mx/step,(my-low)/step,cv2.INTER_LINEAR,borderMode=cv2.BORDER_REFLECT_101).astype(np.float32)/65535
+        return engine.render_float(rgb,job['meta'],settings)
     if index==0 and first and first.is_file():
         array=np.load(first,mmap_mode='r');meta=report['meta']
         patch=np.asarray(array[top:min(array.shape[0],top+nh),left:min(array.shape[1],left+nw)]).copy()
@@ -116,6 +130,21 @@ def tile(query):
             other=engine.srgb_encode(original(bounds,settings,index if index else min(1,len(job['report'].get('sources',[]))-1)))
             rgb=np.stack([base.mean(axis=2),other.mean(axis=2),other.mean(axis=2)],axis=2)
             return image_tools.png(rgb),{}
+        elif kind in ('focusmap','focusconfidence'):
+            cache=job['cache']
+            if not cache or not (cache/'focus-maps.npy').is_file():raise ValueError('Focus-selection maps require a focus stack.')
+            maps=np.load(cache/'focus-maps.npy',mmap_mode='r');pixels,_,_,_=sample(maps,bounds)
+            channel=0 if kind=='focusmap' else 1
+            value=cv2.resize(pixels[:,:,channel],(bounds[4],bounds[5]),interpolation=cv2.INTER_NEAREST)
+            if kind=='focusmap':
+                colors=np.uint8(value/max(1,len(job['report']['frames'])-1)*255)
+                rgb=cv2.cvtColor(cv2.applyColorMap(colors,cv2.COLORMAP_TURBO),cv2.COLOR_BGR2RGB).astype(np.float32)/255
+                margin=cv2.resize(pixels[:,:,1],(bounds[4],bounds[5]),interpolation=cv2.INTER_LINEAR)/255
+                alpha=np.clip(margin*3,0,1)[:,:,None];rgb=rgb*alpha+.25*(1-alpha)
+                legend='Source frame: blue = first, red = last. Muted gray means ambiguous selection. This is not a measured depth map.'
+            else:
+                value/=255;rgb=np.stack([1-value,value,np.zeros_like(value)],axis=2);legend='Sharpness margin: red = similar scores, green = clear local winner. Not a probability.'
+            return image_tools.png(rgb),{'legend':legend}
         elif kind in ('coverage','confidence','fallback'):
             cache=job['cache']
             if not cache or not (cache/'maps.npy').is_file():raise ValueError('Support maps require a new RAW build.')

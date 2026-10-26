@@ -1,6 +1,6 @@
 # Pixelshift
 
-A local macOS app for combining Sony α7R V pixel-shift RAW captures into a 16-bit TIFF, with a zoomable before-and-after comparison.
+A local macOS workspace for Sony α7R V pixel-shift reconstruction and focus stacking, with 16-bit TIFF export and a full-resolution before-and-after inspector.
 
 Pixelshift reconstructs color from the original sensor samples. It is an independent implementation, not Sony software or a certified replacement for Imaging Edge.
 
@@ -53,6 +53,24 @@ zsh Start.command
 
 The app exports uncompressed 16-bit RGB BigTIFFs with an embedded sRGB or linear-sRGB ICC profile. A JSON report records settings, alignment measurements, warnings, and interpolation statistics. Editable camera data and the first reference image are kept in a hidden `.pixelshift-data` folder beside the output. Keep this folder to revisit adjustments and support maps. Additional original frames require the source drive.
 
+## Focus stacking
+
+Choose **Focus stack** in **Capture workflow**, select the SD card or source folder, and review the newest candidate sequence. Detection follows capture times, sequence counters, matching exposure settings, and image dimensions; it does **not** certify that focus changed or that the sweep is complete. Pixel-shift captures are excluded. Matching RAW/rendered pairs are deduplicated with RAW preferred. Use the frame checkboxes to exclude unwanted photos, then click **Build focus stack**.
+
+Focus mode supports 2–100 matching ARW, SDR sRGB HIF/HEIF, JPEG, or TIFF frames. For Sony HIF decoding install [libheif](https://github.com/strukturag/libheif):
+
+```sh
+brew install libheif
+```
+
+HIF data is decoded at 16-bit precision from its original 10-bit content. HDR/HLG/PQ and wide-gamut rendered inputs must first be converted to display-encoded sRGB. JPEG inputs retain their original 8-bit source precision despite 16-bit output. Rendered inputs retain their recorded white balance; calibrated RAW white-balance controls are unavailable for focus stacks.
+
+The engine registers scale, rotation, and translation to the first frame to accommodate focus breathing, measures local sharpness with a noise-smoothed modified Laplacian, and blends a three-level Laplacian pyramid. Tune **Focus measurement radius** and **Sharpness selectivity**, or turn alignment off for already aligned sources. The output keeps the source dimensions—approximately 60 MP for full-size α7R V images. It does not multiply resolution.
+
+The **Focus source map** identifies the locally preferred frame; **Focus selection margin** shows the separation between the best two sharpness scores. Neither is a physical depth measurement. Every aligned source reference is cached locally for offline comparisons. Allow roughly 6 GB for a 13-frame, 60 MP stack plus additional temporary space; the app checks available disk space before starting.
+
+A stack cannot restore regions blurred in every frame. Identical recorded focus positions trigger a warning, but some cameras do not record a useful focus distance. Motion, parallax, reflections, defocus halos, and insufficient overlap can still cause artifacts. Inspect boundaries at 100% and use the comparison and maps before relying on the output.
+
 ## Compare the result
 
 After a build, use **Swipe comparison**, **Blink**, **Difference**, or **Registration overlay**. Drag to pan, scroll to zoom, and choose **100%** for one output pixel per device pixel. Hold Space to blink. Select any available original frame as the reference.
@@ -91,7 +109,7 @@ After the launcher has installed the dependencies:
 .venv/bin/python -m unittest discover -p 'test*.py'
 ```
 
-Tests cover exact synthetic 4- and 16-frame reconstruction, color calibration, sequence validation, nested-folder discovery, alignment, output naming, local request authentication, tuning validation, masks, strict thresholds, presets, ICC profiles, offline inspection, and preview/export parity. No camera files are required.
+Tests cover exact synthetic 4- and 16-frame reconstruction, color calibration, sequence validation, nested-folder discovery, alignment, output naming, local request authentication, tuning validation, masks, strict thresholds, presets, ICC profiles, offline inspection, and preview/export parity. Focus tests additionally cover sequence detection, duplicate selection, HDR rejection, focus breathing, complementary sharp-region recovery, offline maps, and the full stacking workflow. No camera files are required.
 
 ## References
 

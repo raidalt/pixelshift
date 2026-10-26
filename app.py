@@ -6,15 +6,15 @@ from http.server import ThreadingHTTPServer,BaseHTTPRequestHandler
 from urllib.parse import urlparse,parse_qs
 import numpy as np
 import cv2,rawpy,tifffile
-import raw_engine,photo_settings,image_tools,inspector
+import raw_engine,photo_settings,image_tools,inspector,focus_engine
 
 ROOT=Path(__file__).resolve().parent
 DEFAULT_OUTPUT=Path.home()/'Pictures'/'Pixel Shift'
 TOKEN=secrets.token_urlsafe(32)
 BASE_H,BASE_W=6336,9504
 STATE={'status':'idle','progress':0,'message':'Ready to build a composite.','phase':'idle','diagnostics':[]}
-LOCK=threading.RLock();CANCEL=threading.Event();CAPTURES={};SCAN_LOCK=threading.Lock();RESULTS={}
-RECONSTRUCTION_KEYS=('alignment_mode','disagreement','minimum_correlation','maximum_shift','region_mode','regions','kernel','support','fallback_support')
+LOCK=threading.RLock();CANCEL=threading.Event();CAPTURES={};SCAN_LOCK=threading.Lock();RESULTS={};FOCUS_CAPTURES={}
+RECONSTRUCTION_KEYS=('alignment_mode','disagreement','minimum_correlation','maximum_shift','region_mode','regions','kernel','support','fallback_support','focus_radius','focus_selectivity','focus_alignment')
 def pick_folder():
     script = 'POSIX path of (choose folder with prompt "Choose your SD card, drive, or photo folder")'
     result = subprocess.run(['osascript', '-e', script], capture_output=True, text=True)
@@ -81,6 +81,113 @@ def scan_captures(folder, count):
         while len(CAPTURES)>1000:CAPTURES.pop(next(iter(CAPTURES)))
     return {'folder':str(root),'sets':found,'total':total,'skipped':skipped,
             'unassigned':total-len(found)*count,'folders':visited,'incomplete':incomplete}
+
+
+def scan_focus(folder):
+    root=Path(folder).expanduser()
+    if not root.is_absolute() and len(root.parts)==1:root=Path('/Volumes')/root
+    root=root.resolve()
+    if not root.is_dir():raise ValueError('The selected drive or folder is unavailable.')
+    pending=[root];seen=set();paths=[];skipped=0;folders=0
+    while pending:
+        directory=pending.pop()
+        try:
+            stat=directory.stat();key=(stat.st_dev,stat.st_ino)
+            if key in seen:continue
+            seen.add(key);folders+=1
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        path=Path(entry.path)
+                        if entry.is_dir(follow_symlinks=True):
+                            if not entry.is_symlink() or path.resolve().is_relative_to(root):pending.append(path)
+                        elif entry.is_file() and path.suffix.lower() in focus_engine.EXTENSIONS:paths.append(path)
+                    except OSError:skipped+=1
+        except OSError:skipped+=1
+    groups=focus_engine.group_rows(focus_engine.metadata(paths));sets=[]
+    with SCAN_LOCK:
+        for rows in groups:
+            key=secrets.token_urlsafe(12);FOCUS_CAPTURES[key]=rows
+            positions={row.get('FocusPosition2') for row in rows if row.get('FocusPosition2') is not None}
+            sets.append({'id':key,'first':Path(rows[0]['SourceFile']).name,'last':Path(rows[-1]['SourceFile']).name,
+                'files':[Path(r['SourceFile']).name for r in rows],'frames':[{'name':Path(r['SourceFile']).name,'focus':r.get('FocusDistance2'),'position':r.get('FocusPosition2')} for r in rows],
+                'focus_varies':len(positions)>1,'verified':False,'width':rows[0].get('ImageWidth'),'height':rows[0].get('ImageHeight')})
+        while len(FOCUS_CAPTURES)>1000:FOCUS_CAPTURES.pop(next(iter(FOCUS_CAPTURES)))
+    return {'folder':str(root),'sets':sets,'folders':folders,'total':len(paths),'skipped':skipped,'unassigned':0}
+
+def focus_overview(capture):
+    with SCAN_LOCK:rows=FOCUS_CAPTURES.get(capture)
+    if not rows:raise ValueError('Select a focus sequence first.')
+    path=rows[0]['SourceFile']
+    # Embedded previews make browsing a large card fast, without full HIF decoding.
+    for tag in ('PreviewImage','ThumbnailImage'):
+        r=subprocess.run(['exiftool','-b','-'+tag,path],capture_output=True)
+        if r.returncode==0 and len(r.stdout)>100:
+            image=cv2.imdecode(np.frombuffer(r.stdout,np.uint8),cv2.IMREAD_COLOR)
+            if image is not None:return image_tools.png(cv2.cvtColor(image,cv2.COLOR_BGR2RGB))
+    return image_tools.png(raw_engine.srgb_encode(focus_engine.preview(focus_engine.decode(path),1200)))
+
+def focus_merge(config):
+    cache=None;success=False
+    try:
+        settings=photo_settings.validate(config.get('settings'))
+        if settings['white_balance']!='camera':raise ValueError('Focus stacks use developed sRGB color. Choose As shot white balance.')
+        with SCAN_LOCK:rows=list(FOCUS_CAPTURES.get(config.get('capture'),[]))
+        selected=config.get('frames')
+        if selected is not None:
+            if not isinstance(selected,list) or any(type(i)!=int or i<0 or i>=len(rows) for i in selected) or len(set(selected))!=len(selected):raise ValueError('Invalid focus frame selection.')
+            rows=[rows[i] for i in sorted(selected)]
+        if not 2<=len(rows)<=100:raise ValueError('Select between 2 and 100 focus frames from one candidate sequence.')
+        focus_engine.check_color(rows);paths=[Path(r['SourceFile']) for r in rows]
+        output=output_path(config.get('output',''),paths,len(paths),settings)
+        width=int(rows[0].get('ImageWidth',9504));height=int(rows[0].get('ImageHeight',6336))
+        needed=width*height*(len(paths)*6+24)+1_000_000_000
+        if shutil.disk_usage(output.parent).free<needed:raise ValueError(f'Allow {needed/1e9:.1f} GB free for this focus stack and its offline references.')
+        import uuid
+        cache=output.parent/'.pixelshift-data'/uuid.uuid4().hex;cache.mkdir(parents=True)
+        previews=[];arrays=[];frames=[];warnings=[];shape=None
+        for i,path in enumerate(paths):
+            check_cancel();update(phase='decode',frame=i+1,total=len(paths),progress=round(i/len(paths)*25),message=f'Decoding focus frame {i+1}/{len(paths)} · {path.name}')
+            rgb=focus_engine.decode(path)
+            if shape is None:shape=rgb.shape
+            if rgb.shape!=shape:raise ValueError('Focus frames must have matching dimensions.')
+            previews.append(focus_engine.preview(rgb));dest=np.lib.format.open_memmap(cache/f'frame-{i}.npy',mode='w+',dtype='uint16',shape=rgb.shape)
+            for y in range(0,rgb.shape[0],128):check_cancel();dest[y:y+128]=np.rint(np.clip(rgb[y:y+128],0,1)*65535).astype(np.uint16)
+            dest.flush();del dest,rgb;arrays.append(np.load(cache/f'frame-{i}.npy',mmap_mode='r'))
+        h,w=shape[:2];ratio=w/previews[0].shape[1]
+        for i,preview in enumerate(previews):
+            check_cancel();update(phase='alignment',progress=25+round(i/len(paths)*10),message=f'Aligning focus frame {i+1}/{len(paths)} · correcting scale and translation')
+            if i==0 or settings['focus_alignment']=='none':matrix=np.eye(2,3,dtype=np.float32);corr=1.;scale=1.;inliers=0
+            else:matrix,corr,scale,inliers=focus_engine.register(previews[0],preview)
+            matrix[:,2]*=ratio
+            warning=None
+            if corr<.8:warning=f'{path.name}: low focus-frame correlation ({corr:.3f}); inspect registration and moving subjects.';warnings.append(warning)
+            frames.append({'name':paths[i].name,'x':float(matrix[0,2]),'y':float(matrix[1,2]),'confidence':corr,'patch_spread':0.,'warning':warning,'matrix':matrix.tolist(),'scale':scale,'inliers':inliers})
+            update(diagnostics=frames.copy(),warnings=warnings.copy())
+        positions={r.get('FocusPosition2') for r in rows if r.get('FocusPosition2') is not None}
+        if len(positions)<=1:warnings.append('No changing focus position was recorded. This is a candidate burst, not a verified focus sweep; stacking cannot restore detail that is out of focus in every frame.')
+        linear=np.lib.format.open_memmap(cache/'linear.npy',mode='w+',dtype='float32',shape=(h,w,3))
+        maps=np.lib.format.open_memmap(cache/'focus-maps.npy',mode='w+',dtype='uint8',shape=(h,w,2));contribution=np.zeros(len(paths),np.int64);confidence_sum=0.;invalid=0
+        update(phase='reconstruction',phase_started=time.monotonic(),phase_fraction=0,warnings=warnings)
+        # Each band begins on the same pyramid phase; a 96px halo exceeds all filters.
+        for y in range(0,h,96):
+            check_cancel();start=max(0,y-96);end=min(h,y+192);images=[];validity=[]
+            for array,frame in zip(arrays,frames):
+                rgb,valid=focus_engine.warp_band(array,np.asarray(frame['matrix'],np.float32),start,end-start,w);images.append(rgb);validity.append(valid)
+            fused,winner,confidence,missing=focus_engine.fuse(images,validity,settings);a=y-start;b=min(y+96,h)-start
+            linear[y:y+b-a]=fused[a:b];maps[y:y+b-a,:,0]=winner[a:b];maps[y:y+b-a,:,1]=np.rint(confidence[a:b]*255).astype(np.uint8)
+            contribution+=np.bincount(winner[a:b].ravel(),minlength=len(paths));confidence_sum+=float(confidence[a:b].sum());invalid+=int(missing[a:b].sum())
+            update(progress=35+round(min(y+96,h)/h*44),phase_fraction=min(y+96,h)/h,message=f'Blending focused detail · {round(min(y+96,h)/h*100)}%')
+        linear.flush();maps.flush();del maps
+        report={'kind':'focus','scale':1,'sources':[str(p) for p in paths],'frames':frames,'warnings':warnings,'registration_regions':[],
+            'focus':{'method':'Modified-Laplacian sharpness with three-level Laplacian pyramid blending','candidate_only':True,'positions':sorted(positions),'frame_contributions':(contribution/(h*w)).tolist(),'mean_selection_margin':confidence_sum/(h*w),'uncovered_fraction':invalid/(h*w)},'reconstruction_settings':settings}
+        meta={'space':'linear_srgb','crop':[0,0,w,h]}
+        path=export_file(linear,meta,settings,output,report,cache);del linear
+        info=remember(path);success=True;update(status='done',phase='done',progress=100,message=f'Saved focus stack · {output}',output=str(output),inspection=info,warnings=warnings,ended=time.monotonic())
+    except InterruptedError as e:update(status='cancelled',phase='cancelled',message=str(e),ended=time.monotonic())
+    except Exception as e:update(status='error',phase='error',message=str(e),ended=time.monotonic());traceback.print_exc()
+    finally:
+        if cache and not success:shutil.rmtree(cache,ignore_errors=True)
 
 
 def update(**values):
@@ -286,7 +393,7 @@ def export_active(config):
 def launch(target,config):
     with LOCK:
         if STATE['status']=='running':raise ValueError('A processing job is already running.')
-        STATE.update(status='running',phase='validation',progress=0,message='Checking source and settings…',started=time.monotonic(),ended=None,warnings=[],diagnostics=[],output=None)
+        STATE.update(mode=config.get('mode','pixelshift'),status='running',phase='validation',progress=0,message='Checking source and settings…',started=time.monotonic(),ended=None,warnings=[],diagnostics=[],output=None)
     CANCEL.clear();threading.Thread(target=target,args=(config,),daemon=True).start()
 
 class Handler(BaseHTTPRequestHandler):
@@ -305,7 +412,7 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path=='/api/presets':return self.reply(presets())
             if parsed.path=='/api/tile':
                 body,stats=inspector.tile(query);return self.binary(body,'image/png',stats)
-            if parsed.path=='/api/source-overview':return self.binary(source_overview(query.get('capture')),'image/png')
+            if parsed.path=='/api/source-overview':return self.binary((focus_overview if query.get('mode')=='focus' else source_overview)(query.get('capture')),'image/png')
             if parsed.path=='/':
                 body=(ROOT/'static/index.html').read_text().replace('__TOKEN__',TOKEN).replace('__DEFAULT_OUTPUT__',json.dumps(str(DEFAULT_OUTPUT))).replace('__DEFAULT_SETTINGS__',json.dumps(photo_settings.DEFAULTS))
                 return self.binary(body.encode(),'text/html; charset=utf-8')
@@ -324,8 +431,8 @@ class Handler(BaseHTTPRequestHandler):
             if self.path=='/api/pick-folder':return self.reply({'folder':pick_folder()})
             if self.path=='/api/pick':
                 folder=pick_folder()
-                return self.reply(scan_captures(folder,int(config.get('count',16))) if folder else {'cancelled':True})
-            if self.path=='/api/scan':return self.reply(scan_captures(config['folder'],int(config.get('count',16))))
+                return self.reply((scan_focus(folder) if config.get('mode')=='focus' else scan_captures(folder,int(config.get('count',16)))) if folder else {'cancelled':True})
+            if self.path=='/api/scan':return self.reply(scan_focus(config['folder']) if config.get('mode')=='focus' else scan_captures(config['folder'],int(config.get('count',16))))
             if self.path=='/api/presets':return self.reply(save_preset(config))
             if self.path=='/api/open':
                 if STATE['status']=='running':raise ValueError('Wait for the current job to finish.')
@@ -333,7 +440,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not path:raise ValueError('Result not found.')
                 return self.reply(remember(path))
             if self.path=='/api/view':return self.reply(inspector.view(config.get('settings',{})))
-            if self.path=='/api/start':photo_settings.validate(config.get('settings'));launch(merge,config);return self.reply({'ok':True})
+            if self.path=='/api/start':photo_settings.validate(config.get('settings'));launch(focus_merge if config.get('mode')=='focus' else merge,config);return self.reply({'ok':True})
             if self.path=='/api/export':photo_settings.validate(config.get('settings'));launch(export_active,config);return self.reply({'ok':True})
             self.send_error(404)
         except (ValueError,KeyError,OSError,TypeError) as e:self.reply({'error':str(e)},400)
@@ -341,7 +448,8 @@ class Handler(BaseHTTPRequestHandler):
 if __name__=='__main__':
     items=library()
     if items:
-        try:remember(RESULTS[items[0]['id']])
+        try:
+            info=remember(RESULTS[items[0]['id']]);STATE.update(status='done',phase='saved',progress=100,message='Opened '+Path(info['output']).name,warnings=info.get('warnings',[]),mode=info.get('kind','pixelshift'))
         except Exception:pass
     server=ThreadingHTTPServer(('127.0.0.1',int(os.environ.get('PIXELSHIFT_PORT','0'))),Handler)
     url=f'http://127.0.0.1:{server.server_port}';print(f'Pixelshift: {url}\nKeep this window open. Control-C to stop.',flush=True)

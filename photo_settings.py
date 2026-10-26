@@ -5,12 +5,12 @@ DEFAULTS = dict(alignment_mode='warn', disagreement=1.5, minimum_correlation=.90
     maximum_shift=16., region_mode='auto', regions=[], kernel='triangle', support=1.,
     fallback_support=1.5, exposure=0., white_balance='camera', temperature=6500., tint=0.,
     sharpening=0., sharpening_radius=.8, denoise=0., encoding='srgb', border=0,
-    filename='Pixelshift-{first}-{count}frames')
+    filename='Pixelshift-{first}-{count}frames',focus_radius=3.,focus_selectivity=8.,focus_alignment='similarity')
 RANGES = dict(disagreement=(.05,16),minimum_correlation=(.5,.99999),maximum_shift=(1,64),
     support=(.5,2),fallback_support=(1.1,2),exposure=(-5,5),temperature=(2000,15000),
-    tint=(-100,100),sharpening=(0,2),sharpening_radius=(.3,3),denoise=(0,100),border=(0,128))
+    tint=(-100,100),sharpening=(0,2),sharpening_radius=(.3,3),denoise=(0,100),border=(0,128),focus_radius=(1,12),focus_selectivity=(2,24))
 CHOICES=dict(alignment_mode=('warn','strict'),region_mode=('auto','manual'),kernel=('triangle','cosine'),
-    white_balance=('camera','custom'),encoding=('srgb','linear'))
+    white_balance=('camera','custom'),encoding=('srgb','linear'),focus_alignment=('similarity','none'))
 
 def validate(values=None):
     result={**DEFAULTS,**(values or {})}
