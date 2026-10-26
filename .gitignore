@@ -1,0 +1,52 @@
+# Local environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+# Private settings and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+# Photos, generated previews, capture reports, and intermediate data
+*.arw
+*.ARW
+*.arq
+*.ARQ
+*.dng
+*.DNG
+*.tif
+*.tiff
+*.TIF
+*.TIFF
+*.jpg
+*.jpeg
+*.png
+*.heic
+*.heif
+*.npy
+*.npz
+*.partial
+*.tif.json
+*.tiff.json
+.pixelshift-*/
+work/
+outputs/
+*.log
+*.zip
+# Case-insensitive photo/report extensions
+*.[aA][rR][wW]
+*.[aA][rR][qQ]
+*.[dD][nN][gG]
+*.[tT][iI][fF]
+*.[tT][iI][fF][fF]
+*.[jJ][pP][gG]
+*.[jJ][pP][eE][gG]
+*.[pP][nN][gG]
+*.[hH][eE][iI][cC]
+*.[hH][eE][iI][fF]
+*.[tT][iI][fF].json
+*.[tT][iI][fF][fF].json
