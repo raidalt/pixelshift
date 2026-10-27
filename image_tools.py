@@ -26,10 +26,14 @@ def profile(linear=False):
     # ICC.1 permits an all-zero optional profile ID. Color transforms use the tags.
     return bytes(header)+body
 
-def statistics(linear):
+def statistics(linear,encoded=None):
     clipped_high=np.any(linear>=1,axis=2);clipped_low=np.all(linear<=0,axis=2)
-    encoded=raw_engine.srgb_encode(linear)
-    hist=[np.histogram(encoded[:,:,c],bins=64,range=(0,1))[0].tolist() for c in range(3)]
+    if encoded is None:encoded=raw_engine.srgb_encode(linear)
+    hist=[]
+    for c in range(3):
+        values=encoded[:,:,c].ravel();values=values[np.isfinite(values)]
+        bins=np.minimum((values*64).astype(np.int32),63)
+        hist.append(np.bincount(bins,minlength=64).tolist())
     return {'highlights':float(clipped_high.mean()),'shadows':float(clipped_low.mean()),'histogram':hist,'pixels':int(clipped_high.size)}
 
 def png(rgb):

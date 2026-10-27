@@ -1,24 +1,19 @@
 """Local focus stacking: similarity registration and multiscale sharpness fusion."""
 import json,re,shutil,subprocess,tempfile
+from functools import lru_cache
+import heif_native
 from pathlib import Path
 from datetime import datetime
 import cv2
 import numpy as np
 import rawpy
+import capture_metadata
 import raw_engine
 
 EXTENSIONS={'.arw','.jpg','.jpeg','.hif','.heic','.heif','.tif','.tiff'}
 
 def metadata(paths):
-    exe=shutil.which('exiftool')
-    if not exe:raise ValueError('ExifTool is required to discover capture sequences.')
-    rows=[]
-    tags=['Model','DateTimeOriginal','SubSecTimeOriginal','SequenceNumber','SequenceImageNumber','FocusPosition2','FocusDistance2','ExposureTime','FNumber','ISO','PixelShiftInfo','ImageWidth','ImageHeight','ColorSpace','TransferCharacteristics','ColorPrimaries','ProfileDescription']
-    for start in range(0,len(paths),100):
-        r=subprocess.run([exe,'-j','-n',*['-'+t for t in tags],*[str(p) for p in paths[start:start+100]]],capture_output=True,text=True)
-        if r.returncode not in (0,1):raise ValueError('Could not read image metadata.')
-        rows+=json.loads(r.stdout or '[]')
-    return rows
+    return capture_metadata.read(paths)
 
 def timestamp(row):
     try:return datetime.strptime(str(row['DateTimeOriginal']),'%Y:%m:%d %H:%M:%S').timestamp()+float('0.'+str(row.get('SubSecTimeOriginal','0')))
@@ -50,6 +45,40 @@ def group_rows(rows):
     finish()
     return sorted(groups,key=lambda group:timestamp(group[-1]),reverse=True)
 
+@lru_cache(maxsize=10)
+def linear_lut(bits,quantized=False):
+    # Match heif-convert's PNG precision exactly (high-bit inputs are left-shifted).
+    code=np.arange(1<<bits,dtype=np.uint16)
+    encoded=code.astype(np.float32)/255 if bits==8 else np.left_shift(code,16-bits).astype(np.float32)/65535
+    linear=raw_engine.srgb_decode(encoded)
+    return np.rint(linear*65535).astype(np.uint16) if quantized else linear
+
+def decode_to_cache(path,target,check_cancel=lambda:None):
+    """Decode directly into a disk-backed linear reference with bounded conversion buffers."""
+    path=Path(path)
+    if path.suffix.lower() in ('.hif','.heif','.heic'):
+        try:
+            with heif_native.pixels(path) as (pixels,bits):
+                result=np.lib.format.open_memmap(target,mode='w+',dtype='uint16',shape=pixels.shape)
+                lut=linear_lut(bits,True)
+                for y in range(0,pixels.shape[0],128):
+                    check_cancel();result[y:y+128]=lut[pixels[y:y+128]]
+                result.flush()
+                # Registration must see the same float preview as the original pipeline.
+                # Resizing quantized uint16 references perturbs ORB matches on defocused scenes.
+                thumbnail=preview(linear_lut(bits)[pixels])
+                np.save(Path(target).with_suffix('.preview.npy'),gray(thumbnail))
+                del result
+                return thumbnail,'libheif-direct'
+        except heif_native.Unavailable:pass
+    rgb=decode(path);result=np.lib.format.open_memmap(target,mode='w+',dtype='uint16',shape=rgb.shape)
+    thumbnail=preview(rgb)
+    for y in range(0,rgb.shape[0],128):
+        check_cancel();result[y:y+128]=np.rint(np.clip(rgb[y:y+128],0,1)*65535).astype(np.uint16)
+    result.flush();np.save(Path(target).with_suffix('.preview.npy'),gray(thumbnail));del result,rgb
+    return thumbnail,'libraw' if path.suffix.lower()=='.arw' else 'image-decoder'
+
+
 def decode(path):
     """Return full-resolution scene-linear sRGB, using recorded SDR encoding."""
     path=Path(path);ext=path.suffix.lower()
@@ -61,6 +90,9 @@ def decode(path):
                 x=max(0,sizes.crop_left_margin-sizes.left_margin);y=max(0,sizes.crop_top_margin-sizes.top_margin);rgb=rgb[y:y+6336,x:x+9504]
         return rgb.astype(np.float32)/65535
     if ext in ('.hif','.heif','.heic'):
+        try:
+            with heif_native.pixels(path) as (pixels,bits):return linear_lut(bits)[pixels]
+        except heif_native.Unavailable:pass
         exe=shutil.which('heif-convert')
         if not exe:raise ValueError('HIF decoding needs libheif. Install with: brew install libheif')
         with tempfile.TemporaryDirectory(prefix='pixelshift-heif-') as directory:
@@ -86,7 +118,9 @@ def check_color(rows):
 def preview(linear,width=1600):
     h,w=linear.shape[:2];return cv2.resize(linear,(min(width,w),round(h*min(width,w)/w)),interpolation=cv2.INTER_AREA)
 
-def gray(rgb):return cv2.cvtColor(raw_engine.srgb_encode(rgb).astype(np.float32),cv2.COLOR_RGB2GRAY)
+def gray(rgb):
+    if rgb.ndim==2:return rgb
+    return cv2.cvtColor(raw_engine.srgb_encode(rgb).astype(np.float32),cv2.COLOR_RGB2GRAY)
 
 def register(reference,current):
     """Similarity transform maps reference coordinates into the source (focus breathing)."""
@@ -130,14 +164,20 @@ def sharpness(rgb,radius=3):
     return cv2.GaussianBlur(dx+dy,(0,0),float(radius))
 
 def fuse(images,validity,settings):
-    scores=np.stack([sharpness(rgb,settings['focus_radius']) for rgb in images])
-    scores=np.where(np.stack(validity),scores,0)
-    best=scores.max(axis=0);winner=scores.argmax(axis=0)
-    sorted_scores=np.partition(scores,-2,axis=0);confidence=(best-sorted_scores[-2])/(best+1e-7)
-    weights=((scores+1e-8)/(best[None]+1e-8))**settings['focus_selectivity']
-    weights*=np.stack(validity)
-    none=weights.sum(axis=0)<1e-12;weights[0,none]=1
-    weights/=weights.sum(axis=0)[None]
+    # Streaming top-two reduction avoids a full per-pixel sort/copy of the stack.
+    scores=[];best=np.zeros(images[0].shape[:2],np.float32);second=best.copy();scratch=best.copy()
+    winner=np.zeros(best.shape,np.uint8)
+    for i,(rgb,valid) in enumerate(zip(images,validity)):
+        score=sharpness(rgb,settings['focus_radius']);score*=valid;scores.append(score)
+        better=score>best;np.copyto(winner,i,where=better)
+        np.minimum(best,score,out=scratch);np.maximum(second,scratch,out=second);np.maximum(best,score,out=best)
+    confidence=(best-second)/(best+1e-7)
+    weights=np.stack(scores);del scores
+    weights+=1e-8;np.divide(weights,best[None]+1e-8,out=weights)
+    np.power(weights,settings['focus_selectivity'],out=weights)
+    for weight,valid in zip(weights,validity):weight*=valid
+    norm=weights.sum(axis=0);none=norm<1e-12;weights[0,none]=1;norm[none]=1
+    weights/=norm[None]
     # Laplacian pyramid fusion avoids hard cut seams while retaining focused detail.
     levels=3;total=[None]*(levels+1)
     sums=[None]*(levels+1)
@@ -146,7 +186,15 @@ def fuse(images,validity,settings):
         for _ in range(levels):gp.append(cv2.pyrDown(gp[-1]));wp.append(cv2.pyrDown(wp[-1]))
         lp=[gp[k]-cv2.pyrUp(gp[k+1],dstsize=(gp[k].shape[1],gp[k].shape[0])) for k in range(levels)]+[gp[-1]]
         for k in range(levels+1):
-            value=lp[k]*wp[k][:,:,None];total[k]=value if total[k] is None else total[k]+value;sums[k]=wp[k].copy() if sums[k] is None else sums[k]+wp[k]
+            value=lp[k]*wp[k][:,:,None]
+            if total[k] is None:total[k]=value;sums[k]=wp[k].copy()
+            else:total[k]+=value;sums[k]+=wp[k]
     fused=total[-1]/np.maximum(sums[-1][:,:,None],1e-8)
     for k in reversed(range(levels)):fused=cv2.pyrUp(fused,dstsize=(total[k].shape[1],total[k].shape[0]))+total[k]/np.maximum(sums[k][:,:,None],1e-8)
     return np.clip(fused,0,1),winner.astype(np.uint8),confidence,none
+
+def band_geometry(settings,height):
+    """Pyramid-aligned bands with enough halo for the largest supported filters."""
+    halo=int(np.ceil((settings['focus_radius']*4+40)/8)*8)
+    core=256
+    for y in range(0,height,core):yield y,max(0,y-halo),min(height,y+core+halo),min(y+core,height)

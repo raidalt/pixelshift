@@ -1,5 +1,6 @@
 """Disk-backed full-image inspection. Original photos never leave loopback."""
 import json, threading
+from collections import OrderedDict
 from pathlib import Path
 import numpy as np
 import cv2
@@ -15,7 +16,7 @@ def open_report(path):
     global ACTIVE
     path=Path(path);report=json.loads(path.read_text());output=Path(str(path)[:-5])
     if not output.is_file():raise ValueError('The output TIFF is unavailable.')
-    image=tifffile.memmap(output)
+    image=tifffile.memmap(output,mode='r')
     cache=Path(report.get('cache') or '')
     has_raw=bool(report.get('cache')) and (cache/'linear.npy').is_file()
     linear=np.load(cache/'linear.npy',mmap_mode='r') if has_raw else image
@@ -24,7 +25,7 @@ def open_report(path):
     if not has_raw:settings['white_balance']='camera';settings['border']=0
     with LOCK:
         ACTIVE={'report':report,'output':output,'image':image,'linear':linear,'meta':meta,'cache':cache if has_raw else None,
-                'legacy':not has_raw,'settings':settings,'views':{},'source_cache':{},'version':output.stat().st_mtime_ns}
+                'tiles':OrderedDict(),'tile_bytes':0,'legacy':not has_raw,'settings':settings,'views':{},'source_cache':{},'version':output.stat().st_mtime_ns}
     return describe()
 
 def require():
@@ -93,16 +94,15 @@ def original(bounds,settings,index=0,aligned=True):
         array=np.load(source,mmap_mode='r');matrix=np.array(shift.get('matrix',[[1,0,0],[0,1,0]]),np.float32) if aligned else np.eye(2,3,dtype=np.float32)
         xx=np.linspace(x,x+w-1,ow,dtype=np.float32)[None,:];yy=np.linspace(y,y+h-1,oh,dtype=np.float32)[:,None]
         mx=matrix[0,0]*xx+matrix[0,1]*yy+matrix[0,2];my=matrix[1,0]*xx+matrix[1,1]*yy+matrix[1,2]
-        low=max(0,int(my.min())-3);high=min(array.shape[0],int(my.max())+4)
-        if high<=low:raise ValueError('Reference crop is outside the image.')
-        # Decimate fit views before resampling to keep full-image inspection bounded.
-        step=max(1,int(min(w/max(ow,1),h/max(oh,1))))
-        patch=np.asarray(array[low:high:step,::step]).copy()
-        rgb=cv2.remap(patch,mx/step,(my-low)/step,cv2.INTER_LINEAR,borderMode=cv2.BORDER_REFLECT_101).astype(np.float32)/65535
+        # A contiguous read-only memmap can be sampled directly by OpenCV. No full-width copy.
+        rgb=cv2.remap(array,mx,my,cv2.INTER_LINEAR,borderMode=cv2.BORDER_REFLECT_101).astype(np.float32)/65535
         return engine.render_float(rgb,job['meta'],settings)
     if index==0 and first and first.is_file():
         array=np.load(first,mmap_mode='r');meta=report['meta']
-        patch=np.asarray(array[top:min(array.shape[0],top+nh),left:min(array.shape[1],left+nw)]).copy()
+        mapx=np.linspace(x/scale+sx,(x+w-1)/scale+sx,ow,dtype=np.float32)
+        mapy=np.linspace(y/scale+sy,(y+h-1)/scale+sy,oh,dtype=np.float32)
+        rgb=cv2.remap(array,np.broadcast_to(mapx,(oh,ow)).copy(),np.broadcast_to(mapy[:,None],(oh,ow)).copy(),cv2.INTER_NEAREST,borderMode=cv2.BORDER_REPLICATE)
+        return engine.render_float(rgb,meta,{**settings,'sharpening_radius':max(.3,settings.get('sharpening_radius',.8)/max(1,w/ow))})
     else:
         if not sources or not Path(sources[index]).is_file():raise ValueError('Original RAW is offline. Reconnect its source drive, then rebuild to cache the first reference.')
         path=sources[index]
@@ -119,7 +119,7 @@ def original(bounds,settings,index=0,aligned=True):
     rgb=cv2.remap(patch,np.broadcast_to(mapx,(oh,ow)).copy(),np.broadcast_to(mapy[:,None],(oh,ow)).copy(),cv2.INTER_NEAREST,borderMode=cv2.BORDER_REPLICATE)
     return engine.render_float(rgb,meta,{**settings,'sharpening_radius':max(.3,settings.get('sharpening_radius',.8)/max(1,w/ow))})
 
-def tile(query):
+def _tile(query):
     with LOCK:
         job=require();settings=job['views'].get(query.get('view'))
         if settings is None:raise ValueError('Preview settings expired. Refresh the inspector.')
@@ -154,11 +154,27 @@ def tile(query):
             rgb=np.stack([1-value,value,np.zeros_like(value)],axis=2) if kind!='fallback' else np.stack([value,value*.25,np.zeros_like(value)],axis=2)
             return image_tools.png(rgb),{'legend':'Red: weak support / Green: strong support' if kind!='fallback' else 'Orange: wider interpolation used; black: compact support'}
         else:linear=composite(bounds,settings)
-        stats=image_tools.statistics(linear)
         rgb=engine.srgb_encode(linear)
+        stats=image_tools.statistics(linear,rgb)
         if kind=='difference':
             before=engine.srgb_encode(original(bounds,settings,index));rgb=np.clip(np.abs(rgb-before)*max(1,min(32,float(query.get('gain',4)))),0,1)
         overlay=query.get('clip','off')
         if overlay in ('high','both'):rgb[np.any(linear>=1,axis=2)]=[1,.1,.1]
         if overlay in ('low','both'):rgb[np.all(linear<=0,axis=2)]=[.1,.3,1]
         return image_tools.png(rgb),stats
+
+
+def tile(query):
+    with LOCK:
+        job=require();settings=job['views'].get(query.get('view'))
+        if settings is None:raise ValueError('Preview settings expired. Refresh the inspector.')
+        rendering=('exposure','white_balance','temperature','tint','sharpening','sharpening_radius','denoise')
+        key=(tuple(region(query)),tuple((k,settings[k]) for k in rendering),tuple((k,str(query.get(k,''))) for k in ('kind','reference','clip','gain')))
+        cache=job['tiles']
+        if key in cache:cache.move_to_end(key);return cache[key]
+        result=_tile(query);size=len(result[0])
+        if size<=32*1024**2:
+            cache[key]=result;job['tile_bytes']+=size
+            while job['tile_bytes']>32*1024**2 or len(cache)>24:
+                _,old=cache.popitem(last=False);job['tile_bytes']-=len(old[0])
+        return result

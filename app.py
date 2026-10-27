@@ -6,7 +6,7 @@ from http.server import ThreadingHTTPServer,BaseHTTPRequestHandler
 from urllib.parse import urlparse,parse_qs
 import numpy as np
 import cv2,rawpy,tifffile
-import raw_engine,photo_settings,image_tools,inspector,focus_engine
+import raw_engine,photo_settings,image_tools,inspector,focus_engine,performance_runtime,reference_cache
 
 ROOT=Path(__file__).resolve().parent
 DEFAULT_OUTPUT=Path.home()/'Pictures'/'Pixel Shift'
@@ -141,19 +141,39 @@ def focus_merge(config):
         focus_engine.check_color(rows);paths=[Path(r['SourceFile']) for r in rows]
         output=output_path(config.get('output',''),paths,len(paths),settings)
         width=int(rows[0].get('ImageWidth',9504));height=int(rows[0].get('ImageHeight',6336))
-        needed=width*height*(len(paths)*6+24)+1_000_000_000
+        source_versions=[reference_cache.key(path) for path in paths]
+        reusable=reference_cache.find(paths,output.parent)
+        needed=width*height*(sum(p is None for p in reusable)*6+24)+1_000_000_000
         if shutil.disk_usage(output.parent).free<needed:raise ValueError(f'Allow {needed/1e9:.1f} GB free for this focus stack and its offline references.')
         import uuid
         cache=output.parent/'.pixelshift-data'/uuid.uuid4().hex;cache.mkdir(parents=True)
-        previews=[];arrays=[];frames=[];warnings=[];shape=None
-        for i,path in enumerate(paths):
-            check_cancel();update(phase='decode',frame=i+1,total=len(paths),progress=round(i/len(paths)*25),message=f'Decoding focus frame {i+1}/{len(paths)} · {path.name}')
-            rgb=focus_engine.decode(path)
-            if shape is None:shape=rgb.shape
-            if rgb.shape!=shape:raise ValueError('Focus frames must have matching dimensions.')
-            previews.append(focus_engine.preview(rgb));dest=np.lib.format.open_memmap(cache/f'frame-{i}.npy',mode='w+',dtype='uint16',shape=rgb.shape)
-            for y in range(0,rgb.shape[0],128):check_cancel();dest[y:y+128]=np.rint(np.clip(rgb[y:y+128],0,1)*65535).astype(np.uint16)
-            dest.flush();del dest,rgb;arrays.append(np.load(cache/f'frame-{i}.npy',mmap_mode='r'))
+        previews=[];arrays=[];frames=[];warnings=[];shape=None;timings={};stage_started=time.perf_counter();decoders=set()
+        # Warm the optional library before starting independent decode contexts.
+        try:focus_engine.heif_native.library()
+        except focus_engine.heif_native.Unavailable:pass
+        decode_workers=performance_runtime.workers(width*height*24) if all(p.suffix.lower() in ('.hif','.heic','.heif') for p in paths) else 1
+        def decode_frame(item):
+            i,path=item;check_cancel()
+            if reusable[i] is not None:
+                os.link(reusable[i],cache/f'frame-{i}.npy');preview_file=reusable[i].with_suffix('.preview.npy');destination=(cache/f'frame-{i}.npy').with_suffix('.preview.npy')
+                if preview_file.is_file():
+                    thumb=np.load(preview_file,allow_pickle=False)
+                    if thumb.dtype!=np.float32 or thumb.ndim!=2:raise ValueError('Invalid cached registration preview. Rebuild from the originals.')
+                    os.link(preview_file,destination)
+                else:
+                    thumb=focus_engine.gray(focus_engine.preview(focus_engine.decode(path)));np.save(destination,thumb)
+                backend='decoded-reference-cache'
+            else:thumb,backend=focus_engine.decode_to_cache(path,cache/f'frame-{i}.npy',check_cancel)
+            if source_versions[i] is not None and reference_cache.key(path)!=source_versions[i]:raise ValueError(f'Source changed during decoding: {path.name}')
+            return i,thumb,backend
+        update(phase='decode',message=f'Decoding {len(paths)} focus frames…')
+        for i,thumbnail,backend in performance_runtime.ordered_map(decode_frame,enumerate(paths),decode_workers,check_cancel):
+            previews.append(thumbnail);decoders.add(backend);array=np.load(cache/f'frame-{i}.npy',mmap_mode='r')
+            if shape is None:shape=array.shape
+            if array.shape!=shape:raise ValueError('Focus frames must have matching dimensions.')
+            arrays.append(array)
+            update(phase='decode',frame=i+1,total=len(paths),progress=round((i+1)/len(paths)*25),message=f'Decoded focus frame {i+1}/{len(paths)} · {paths[i].name}')
+        timings['decode']=time.perf_counter()-stage_started;stage_started=time.perf_counter()
         h,w=shape[:2];ratio=w/previews[0].shape[1]
         for i,preview in enumerate(previews):
             check_cancel();update(phase='alignment',progress=25+round(i/len(paths)*10),message=f'Aligning focus frame {i+1}/{len(paths)} · correcting scale and translation')
@@ -164,25 +184,33 @@ def focus_merge(config):
             if corr<.8:warning=f'{path.name}: low focus-frame correlation ({corr:.3f}); inspect registration and moving subjects.';warnings.append(warning)
             frames.append({'name':paths[i].name,'x':float(matrix[0,2]),'y':float(matrix[1,2]),'confidence':corr,'patch_spread':0.,'warning':warning,'matrix':matrix.tolist(),'scale':scale,'inliers':inliers})
             update(diagnostics=frames.copy(),warnings=warnings.copy())
+        timings['alignment']=time.perf_counter()-stage_started;stage_started=time.perf_counter();del previews
         positions={r.get('FocusPosition2') for r in rows if r.get('FocusPosition2') is not None}
         if len(positions)<=1:warnings.append('No changing focus position was recorded. This is a candidate burst, not a verified focus sweep; stacking cannot restore detail that is out of focus in every frame.')
         linear=np.lib.format.open_memmap(cache/'linear.npy',mode='w+',dtype='float32',shape=(h,w,3))
         maps=np.lib.format.open_memmap(cache/'focus-maps.npy',mode='w+',dtype='uint8',shape=(h,w,2));contribution=np.zeros(len(paths),np.int64);confidence_sum=0.;invalid=0
         update(phase='reconstruction',phase_started=time.monotonic(),phase_fraction=0,warnings=warnings)
-        # Each band begins on the same pyramid phase; a 96px halo exceeds all filters.
-        for y in range(0,h,96):
-            check_cancel();start=max(0,y-96);end=min(h,y+192);images=[];validity=[]
+        # Cores remain ordered, but at most two native bands can execute concurrently.
+        geometry=list(focus_engine.band_geometry(settings,h));largest=max(end-start for _,start,end,_ in geometry)
+        fusion_workers=performance_runtime.workers(largest*w*(len(paths)*16+100))
+        def fuse_band(bounds):
+            y,start,end,stop=bounds;check_cancel();images=[];validity=[]
             for array,frame in zip(arrays,frames):
-                rgb,valid=focus_engine.warp_band(array,np.asarray(frame['matrix'],np.float32),start,end-start,w);images.append(rgb);validity.append(valid)
-            fused,winner,confidence,missing=focus_engine.fuse(images,validity,settings);a=y-start;b=min(y+96,h)-start
-            linear[y:y+b-a]=fused[a:b];maps[y:y+b-a,:,0]=winner[a:b];maps[y:y+b-a,:,1]=np.rint(confidence[a:b]*255).astype(np.uint8)
-            contribution+=np.bincount(winner[a:b].ravel(),minlength=len(paths));confidence_sum+=float(confidence[a:b].sum());invalid+=int(missing[a:b].sum())
-            update(progress=35+round(min(y+96,h)/h*44),phase_fraction=min(y+96,h)/h,message=f'Blending focused detail · {round(min(y+96,h)/h*100)}%')
+                check_cancel();rgb,valid=focus_engine.warp_band(array,np.asarray(frame['matrix'],np.float32),start,end-start,w);images.append(rgb);validity.append(valid)
+            fused,winner,confidence,missing=focus_engine.fuse(images,validity,settings);a=y-start;b=stop-start
+            return y,stop,fused[a:b].copy(),winner[a:b].copy(),confidence[a:b].copy(),missing[a:b].copy()
+        for y,stop,fused,winner,confidence,missing in performance_runtime.ordered_map(fuse_band,geometry,fusion_workers,check_cancel):
+            linear[y:stop]=fused;maps[y:stop,:,0]=winner;maps[y:stop,:,1]=np.rint(confidence*255).astype(np.uint8)
+            contribution+=np.bincount(winner.ravel(),minlength=len(paths));confidence_sum+=float(confidence.sum());invalid+=int(missing.sum())
+            update(progress=35+round(stop/h*44),phase_fraction=stop/h,message=f'Blending focused detail · {round(stop/h*100)}%')
         linear.flush();maps.flush();del maps
-        report={'kind':'focus','scale':1,'sources':[str(p) for p in paths],'frames':frames,'warnings':warnings,'registration_regions':[],
+        timings['fusion']=time.perf_counter()-stage_started
+        report={'performance':{'stages_seconds':timings,'decoders':sorted(decoders),'decode_workers':decode_workers,'fusion_workers':fusion_workers,'reused_references':sum(p is not None for p in reusable)},'kind':'focus','scale':1,'sources':[str(p) for p in paths],'frames':frames,'warnings':warnings,'registration_regions':[],
             'focus':{'method':'Modified-Laplacian sharpness with three-level Laplacian pyramid blending','candidate_only':True,'positions':sorted(positions),'frame_contributions':(contribution/(h*w)).tolist(),'mean_selection_margin':confidence_sum/(h*w),'uncovered_fraction':invalid/(h*w)},'reconstruction_settings':settings}
         meta={'space':'linear_srgb','crop':[0,0,w,h]}
         path=export_file(linear,meta,settings,output,report,cache);del linear
+        try:reference_cache.register(paths,cache,source_versions)
+        except OSError:pass  # A cache-index write must not invalidate a successfully exported image.
         info=remember(path);success=True;update(status='done',phase='done',progress=100,message=f'Saved focus stack · {output}',output=str(output),inspection=info,warnings=warnings,ended=time.monotonic())
     except InterruptedError as e:update(status='cancelled',phase='cancelled',message=str(e),ended=time.monotonic())
     except Exception as e:update(status='error',phase='error',message=str(e),ended=time.monotonic());traceback.print_exc()
@@ -287,21 +315,28 @@ def export_file(linear,meta,settings,output,report,cache):
         result=tifffile.memmap(partial,shape=(h-2*border,w-2*border,3),dtype='uint16',bigtiff=True,photometric='rgb',
             extratags=[(34675,'B',len(icc),icc,False)],metadata={'axes':'YXS','Software':'Pixelshift 3',
                 'Description':'Linear sRGB primaries, gamma 1.0' if settings['encoding']=='linear' else 'sRGB transfer curve and primaries'})
-        high=low=pixels=0;hist=np.zeros((3,64),np.int64)
-        for y in range(border,h-border,96):
-            check_cancel();stop=min(y+96,h-border);start=max(0,y-32);end=min(h,stop+32)
-            band=raw_engine.render_float(np.asarray(linear[start:end]).copy(),meta,settings)
+        export_started=time.perf_counter();high=low=pixels=0;hist=np.zeros((3,64),np.int64);padding=32 if settings['denoise'] or settings['sharpening'] else 0
+        for y in range(border,h-border,256):
+            check_cancel();stop=min(y+256,h-border);start=max(0,y-padding);end=min(h,stop+padding)
+            band=raw_engine.render_float(np.asarray(linear[start:end]),meta,settings)
             band=band[y-start:stop-start,border:w-border]
-            stats=image_tools.statistics(band);n=stats['pixels'];pixels+=n;high+=stats['highlights']*n;low+=stats['shadows']*n;hist+=np.array(stats['histogram'])
-            encoded=np.clip(band,0,1) if settings['encoding']=='linear' else raw_engine.srgb_encode(band)
+            display=raw_engine.srgb_encode(band);stats=image_tools.statistics(band,display);n=stats['pixels'];pixels+=n;high+=stats['highlights']*n;low+=stats['shadows']*n;hist+=np.array(stats['histogram'])
+            encoded=np.clip(band,0,1) if settings['encoding']=='linear' else display
             result[y-border:stop-border]=np.rint(encoded*65535).astype(np.uint16)
             update(progress=80+round((stop-border)/(h-2*border)*16),message=f'Encoding TIFF · {round((stop-border)/(h-2*border)*100)}%',phase='export')
         result.flush();del result;check_cancel()
-        with output.open('xb') as destination:
-            created=True
-            with partial.open('rb') as source:shutil.copyfileobj(source,destination,16*1024*1024)
+        # Same-directory hard-link publication is atomic, exclusive, and avoids a full TIFF copy.
+        # Filesystems without hard links keep the existing exclusive-copy fallback.
+        try:
+            os.link(partial,output);created=True
+        except FileExistsError:raise ValueError('Output exists. Choose a new filename.')
+        except OSError:
+            with output.open('xb') as destination:
+                created=True
+                with partial.open('rb') as source:shutil.copyfileobj(source,destination,16*1024*1024)
         partial.unlink()
-        report={**report,'settings':settings,'meta':meta,'cache':str(cache) if cache else None,
+        performance={**report.get('performance',{})};stages={**performance.get('stages_seconds',{})};stages['export']=time.perf_counter()-export_started;performance['stages_seconds']=stages
+        report={**report,'performance':performance,'settings':settings,'meta':meta,'cache':str(cache) if cache else None,
             'width':w-2*border,'height':h-2*border,'full_width':w,'full_height':h,
             'clipping':{'highlights':high/pixels,'shadows':low/pixels,'histogram':hist.tolist()},'output_encoding':settings['encoding']}
         path=Path(str(output)+'.json')
@@ -328,7 +363,7 @@ def merge(config):
         if shutil.disk_usage(output.parent).free<needed:raise ValueError(f'Allow {needed/1e9:.1f} GB free space including the editable RAW cache.')
         import uuid
         cache=output.parent/'.pixelshift-data'/uuid.uuid4().hex;cache.mkdir(parents=True)
-        shifts=[];metas=[];reference=None;regions=None;warnings=[]
+        shifts=[];metas=[];reference=None;regions=None;warnings=[];stage_started=time.perf_counter()
         for i,path in enumerate(paths):
             check_cancel();update(progress=round(i/count*20),phase='alignment',frame=i+1,total=count,message=f'Reading and aligning frame {i+1}/{count}')
             sensor,meta=raw_engine.read_sensor(path)
@@ -344,16 +379,19 @@ def merge(config):
         sensors=[np.load(cache/f'sensor-{i}.npy',mmap_mode='r') for i in range(count)]
         linear=np.lib.format.open_memmap(cache/'linear.npy',mode='w+',shape=(h,w,3),dtype='float32')
         maps=np.lib.format.open_memmap(cache/'maps.npy',mode='w+',shape=(h,w,3),dtype='uint8')
+        alignment_seconds=time.perf_counter()-stage_started;stage_started=time.perf_counter();raw_workers=performance_runtime.workers(96*w*100)
         fallback=0;update(phase='reconstruction',phase_started=time.monotonic(),phase_fraction=0)
-        for y in range(0,h,96):
+        def raw_band(y):
             check_cancel();rows=min(96,h-y)
             rgb,missing,diagnostic=raw_engine.reconstruct_band(sensors,metas,shifts,scale,y,rows,w,settings=settings,diagnostics=True)
+            return y,rows,rgb,missing,diagnostic
+        for y,rows,rgb,missing,diagnostic in performance_runtime.ordered_map(raw_band,range(0,h,96),raw_workers,check_cancel):
             fallback+=missing;linear[y:y+rows]=rgb
             maps[y:y+rows]=np.rint(np.stack([diagnostic['coverage'],diagnostic['confidence'],diagnostic['fallback']],axis=2)*255).astype(np.uint8)
             fraction=(y+rows)/h;update(progress=20+round(fraction*59),phase_fraction=fraction,message=f'Reconstructing RAW samples · {round(fraction*100)}%')
         linear.flush();maps.flush();del maps,sensors
         for i in range(count):(cache/f'sensor-{i}.npy').unlink(missing_ok=True)
-        report={'engine':'raw-cfa-normalized-convolution-v3','frames':shifts,'registration_regions':regions,'scale':scale,
+        report={'performance':{'stages_seconds':{'alignment':alignment_seconds,'reconstruction':time.perf_counter()-stage_started},'reconstruction_workers':raw_workers},'engine':'raw-cfa-normalized-convolution-v3','frames':shifts,'registration_regions':regions,'scale':scale,
             'sources':[str(p) for p in paths],'sony_group':group,'alignment_warnings':warnings,
             'fallback_channel_fraction':fallback/(h*w*3),'reconstruction_settings':{k:settings[k] for k in RECONSTRUCTION_KEYS}}
         path=export_file(linear,metas[0],settings,output,report,cache);del linear

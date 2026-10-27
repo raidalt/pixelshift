@@ -4,18 +4,12 @@ from pathlib import Path
 import numpy as np
 import cv2
 import rawpy
+import capture_metadata
 
 XYZ_FROM_SRGB=np.array([[.4124564,.3575761,.1804375],[.2126729,.7151522,.0721750],[.0193339,.1191920,.9503041]])
 
 def metadata(paths):
-    exe=shutil.which('exiftool')
-    if not exe: raise ValueError('ExifTool is required to verify Sony pixel-shift sequences. Install ExifTool, then restart the app.')
-    rows=[]
-    for start in range(0,len(paths),128):
-        run=subprocess.run([exe,'-j','-n','-Model','-BodySerialNumber','-DateTimeOriginal','-PixelShiftInfo','-ExposureTime','-ISO','-FNumber',*[str(p) for p in paths[start:start+128]]],capture_output=True,text=True)
-        if run.returncode not in (0,1): raise ValueError('Could not read capture metadata: '+run.stderr[:200])
-        rows.extend(json.loads(run.stdout or '[]'))
-    return rows
+    return capture_metadata.read(paths)
 
 def group_rows(rows,count):
     groups={}
@@ -140,7 +134,7 @@ def reconstruct_band(sensors,metas,shifts,scale,y,rows,width,radius=None,setting
     """Normalized convolution of original CFA samples, with measured support maps."""
     settings=settings or {}
     radius=radius or settings.get('support',1.)/scale
-    sums=np.zeros((rows,width,3),np.float32);weights=np.zeros_like(sums);confidence=np.zeros_like(sums)
+    sums=np.zeros((3,rows,width),np.float32);weights=np.zeros_like(sums);confidence=np.zeros_like(sums) if diagnostics else None
     offsets=(-1,0,1) if radius>1 else (0,)
     def kernel(distance):
         t=np.abs(distance)/radius
@@ -164,21 +158,24 @@ def reconstruct_band(sensors,metas,shifts,scale,y,rows,width,radius=None,setting
                         weight=wy[:,None]*wx[None,:]
                         weight*=((iy[:,None]>=0)&(iy[:,None]<sh)&(ix[None,:]>=0)&(ix[None,:]<sw))
                         values=plane[np.clip(iy,0,sh-1)[:,None],np.clip(ix,0,sw-1)[None,:]].astype(np.float32)
-                        values=np.maximum(values-black,0)/(meta['white']-black)
-                        sums[:,:,c]+=values*weight;weights[:,:,c]+=weight
-                        confidence[:,:,c]+=weight*shift.get('confidence',1.)
+                        values-=black;np.maximum(values,0,out=values);values/=(meta['white']-black)
+                        values*=weight;sums[c]+=values;weights[c]+=weight
+                        if diagnostics:
+                            np.multiply(weight,shift.get('confidence',1.),out=values);confidence[c]+=values
     missing=weights<1e-5
     fallback_radius=settings.get('fallback_support',1.5)
     if np.any(missing):
         if radius>=max(fallback_radius,settings.get('support',1.)/scale):raise ValueError('RAW samples do not cover the requested image grid.')
         fallback,_=reconstruct_band(sensors,metas,shifts,scale,y,rows,width,fallback_radius,settings)
-    result=sums/np.maximum(weights,1e-10)
-    if np.any(missing):result[missing]=fallback[missing]
+    result=sums;np.divide(sums,np.maximum(weights,1e-10),out=result)
+    result=np.moveaxis(result,0,-1)
+    if np.any(missing):
+        mask=np.moveaxis(missing,0,-1);result[mask]=fallback[mask]
     count=int(np.count_nonzero(missing))
     if diagnostics:
-        coverage=np.clip(np.min(weights/np.array([1,2,1],np.float32),axis=2),0,1)
-        reliability=np.min(confidence/np.maximum(weights,1e-10),axis=2)
-        return result,count,{'coverage':coverage,'confidence':reliability,'fallback':np.any(missing,axis=2)}
+        coverage=np.minimum(np.minimum(weights[0],weights[1]*.5),weights[2]);np.clip(coverage,0,1,out=coverage)
+        np.divide(confidence,np.maximum(weights,1e-10),out=confidence);reliability=np.min(confidence,axis=0)
+        return result,count,{'coverage':coverage,'confidence':reliability,'fallback':np.any(missing,axis=0)}
     return result,count
 
 def temperature_wb(meta,temperature,tint):

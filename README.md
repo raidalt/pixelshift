@@ -103,6 +103,10 @@ Photo processing happens on your Mac. The server listens only on `127.0.0.1`, an
 
 This repository contains no sample photos, capture reports, credentials, or personal settings. Generated photos, reports, caches, and local environments are excluded by `.gitignore`. Reports generated during use contain local source paths and capture metadata, and editable caches contain image data. Keep these private unless you intend to share them.
 
+## Performance
+
+Direct HIF decoding, bounded parallel processing, reusable references, and faster previews reduce repeat work while preserving image quality. See [performance measurements and benchmarking instructions](PERFORMANCE.md).
+
 ## Development
 
 After the launcher has installed the dependencies:
